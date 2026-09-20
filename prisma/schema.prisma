@@ -1,0 +1,1084 @@
+// MiniCRM - Multi-tenant CRM data model
+// Every tenant-owned table carries tenantId. Application code must always
+// scope reads/writes by the tenant resolved from the authenticated session
+// (see src/server/tenant.ts) - never trust a tenant id supplied by the client.
+// Postgres Row Level Security policies mirroring these constraints live in
+// prisma/rls.sql and are applied as a raw-SQL migration step.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Platform / tenancy
+// ---------------------------------------------------------------------------
+
+model Tenant {
+  id                    String       @id @default(uuid())
+  companyName           String
+  slug                  String       @unique
+  logoUrl               String?
+  industry              String?
+  teamSize              String?
+  timezone              String       @default("Asia/Kolkata")
+  currency              String       @default("INR")
+  country               String?
+  email                 String?
+  phone                 String?
+  address               String?
+  status                TenantStatus @default(ACTIVE)
+  onboardingStep        Int          @default(0)
+  onboardingCompletedAt DateTime?
+  createdAt             DateTime     @default(now())
+  updatedAt             DateTime     @updatedAt
+  deletedAt             DateTime?
+
+  memberships          TenantUser[]
+  invitations          Invitation[]
+  leads                Lead[]
+  contacts             Contact[]
+  tags                 Tag[]
+  customFields         CustomFieldDefinition[]
+  activities           Activity[]
+  notes                Note[]
+  followups            Followup[]
+  pipelines            Pipeline[]
+  customers            Customer[]
+  campaigns            Campaign[]
+  conversations        Conversation[]
+  integrations         IntegrationConnection[]
+  notifications        Notification[]
+  auditLogs            AuditLog[]
+  apiKeys              ApiKey[]
+  webhookSubscriptions OutboundWebhook[]
+  subscription         Subscription?
+  usageRecords         UsageRecord[]
+  automationRules      AutomationRule[]
+  supportSessions      SupportAccessSession[]
+
+  @@index([status])
+}
+
+enum TenantStatus {
+  ACTIVE
+  SUSPENDED
+  CANCELLED
+}
+
+model User {
+  id              String    @id @default(uuid())
+  fullName        String
+  email           String    @unique
+  passwordHash    String
+  mobile          String?
+  avatarUrl       String?
+  isPlatformAdmin Boolean   @default(false)
+  emailVerifiedAt DateTime?
+  lastLoginAt     DateTime?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+  deletedAt       DateTime?
+
+  memberships            TenantUser[]
+  sessions               Session[]
+  verificationTokens     VerificationToken[]
+  passwordResets         PasswordResetToken[]
+  invitationsSent        Invitation[]             @relation("InvitedBy")
+  activities             Activity[]               @relation("ActivityUser")
+  notes                  Note[]                   @relation("NoteUser")
+  followupsAssigned      Followup[]               @relation("FollowupAssignee")
+  followupsCreated       Followup[]               @relation("FollowupCreator")
+  leadsAssigned          Lead[]                   @relation("LeadAssignee")
+  leadsCreated           Lead[]                   @relation("LeadCreator")
+  customersOwned         Customer[]               @relation("CustomerOwner")
+  auditLogs              AuditLog[]
+  notifications          Notification[]
+  apiKeysCreated         ApiKey[]
+  notificationPrefs      NotificationPreference[]
+  supportSessionsAsAdmin SupportAccessSession[]
+}
+
+model Session {
+  id             String   @id @default(uuid())
+  sessionToken   String   @unique
+  userId         String
+  user           User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  activeTenantId String?
+  expiresAt      DateTime
+  ipAddress      String?
+  userAgent      String?
+  createdAt      DateTime @default(now())
+
+  @@index([userId])
+}
+
+model VerificationToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  usedAt    DateTime?
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid())
+  userId    String
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  tokenHash String    @unique
+  expiresAt DateTime
+  createdAt DateTime  @default(now())
+  usedAt    DateTime?
+  ipAddress String?
+}
+
+enum TenantRole {
+  OWNER
+  ADMIN
+  MANAGER
+  SALES_AGENT
+  VIEWER
+}
+
+model TenantUser {
+  id                String           @id @default(uuid())
+  tenantId          String
+  tenant            Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId            String
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  role              TenantRole
+  customPermissions Json? // additive/override grants for future custom roles
+  status            MembershipStatus @default(ACTIVE)
+  invitedById       String?
+  createdAt         DateTime         @default(now())
+  updatedAt         DateTime         @updatedAt
+  deactivatedAt     DateTime?
+
+  @@unique([tenantId, userId])
+  @@index([tenantId, status])
+  @@index([userId])
+}
+
+enum MembershipStatus {
+  ACTIVE
+  DEACTIVATED
+  INVITED
+}
+
+model Invitation {
+  id          String           @id @default(uuid())
+  tenantId    String
+  tenant      Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  email       String
+  role        TenantRole
+  tokenHash   String           @unique
+  invitedById String
+  invitedBy   User             @relation("InvitedBy", fields: [invitedById], references: [id])
+  status      InvitationStatus @default(PENDING)
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  createdAt   DateTime         @default(now())
+
+  @@index([tenantId, status])
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+  REVOKED
+}
+
+// ---------------------------------------------------------------------------
+// Billing / plans / usage
+// ---------------------------------------------------------------------------
+
+model Plan {
+  id              String          @id @default(uuid())
+  code            String          @unique // e.g. "free_trial", "starter"
+  name            String
+  price           Decimal         @db.Decimal(10, 2)
+  currency        String          @default("INR")
+  billingInterval BillingInterval
+  trialDays       Int             @default(14)
+  maxUsers        Int
+  maxLeads        Int
+  maxMessages     Int
+  maxStorageMb    Int
+  features        Json // { whatsapp: true, facebook: true, apiAccess: false, ... }
+  isActive        Boolean         @default(true)
+  sortOrder       Int             @default(0)
+  createdAt       DateTime        @default(now())
+  updatedAt       DateTime        @updatedAt
+
+  subscriptions Subscription[]
+}
+
+enum BillingInterval {
+  MONTHLY
+  YEARLY
+}
+
+model Subscription {
+  id                     String             @id @default(uuid())
+  tenantId               String             @unique
+  tenant                 Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  planId                 String
+  plan                   Plan               @relation(fields: [planId], references: [id])
+  status                 SubscriptionStatus @default(TRIAL)
+  startedAt              DateTime           @default(now())
+  trialEndsAt            DateTime?
+  currentPeriodStart     DateTime           @default(now())
+  currentPeriodEnd       DateTime?
+  cancelledAt            DateTime?
+  provider               String? // "mock" | "stripe" | "razorpay" - pluggable, never hard-coded in logic
+  providerSubscriptionId String?
+  createdAt              DateTime           @default(now())
+  updatedAt              DateTime           @updatedAt
+
+  invoices Invoice[]
+}
+
+enum SubscriptionStatus {
+  TRIAL
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+model Invoice {
+  id                String        @id @default(uuid())
+  subscriptionId    String
+  subscription      Subscription  @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  amount            Decimal       @db.Decimal(10, 2)
+  currency          String
+  status            InvoiceStatus @default(DRAFT)
+  provider          String?
+  providerInvoiceId String?
+  issuedAt          DateTime      @default(now())
+  paidAt            DateTime?
+  periodStart       DateTime
+  periodEnd         DateTime
+
+  payments Payment[]
+}
+
+enum InvoiceStatus {
+  DRAFT
+  OPEN
+  PAID
+  FAILED
+  VOID
+}
+
+model Payment {
+  id                String   @id @default(uuid())
+  invoiceId         String
+  invoice           Invoice  @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  amount            Decimal  @db.Decimal(10, 2)
+  currency          String
+  provider          String
+  providerPaymentId String?
+  status            String
+  createdAt         DateTime @default(now())
+}
+
+model UsageRecord {
+  id          String      @id @default(uuid())
+  tenantId    String
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  metric      UsageMetric
+  periodStart DateTime
+  periodEnd   DateTime
+  value       Int         @default(0)
+  updatedAt   DateTime    @updatedAt
+
+  @@unique([tenantId, metric, periodStart])
+  @@index([tenantId, metric])
+}
+
+enum UsageMetric {
+  LEADS
+  USERS
+  MESSAGES
+  STORAGE_MB
+  API_CALLS
+  AUTOMATION_RUNS
+}
+
+// ---------------------------------------------------------------------------
+// Leads / CRM core
+// ---------------------------------------------------------------------------
+
+enum LeadSource {
+  WHATSAPP
+  FACEBOOK
+  INSTAGRAM
+  GMAIL
+  WEBSITE
+  REFERRAL
+  MANUAL
+  OTHER
+}
+
+enum LeadStatusValue {
+  NEW
+  QUALIFIED
+  HOT
+  FOLLOW_UP
+  HOLD
+  SALE
+  CUSTOMER
+  LOST
+  INVALID
+}
+
+enum LeadPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+model Lead {
+  id                String          @id @default(uuid())
+  tenantId          String
+  tenant            Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadNumber        Int // per-tenant sequential display id, see LeadCounter
+  name              String
+  mobile            String?
+  email             String?
+  company           String?
+  location          String?
+  source            LeadSource      @default(MANUAL)
+  campaignId        String?
+  campaign          Campaign?       @relation(fields: [campaignId], references: [id])
+  adReference       String?
+  status            LeadStatusValue @default(NEW)
+  priority          LeadPriority    @default(MEDIUM)
+  assignedToId      String?
+  assignedTo        User?           @relation("LeadAssignee", fields: [assignedToId], references: [id])
+  createdById       String?
+  createdBy         User?           @relation("LeadCreator", fields: [createdById], references: [id])
+  teamId            String?
+  lastActivityAt    DateTime?
+  nextFollowupAt    DateTime?
+  customFieldValues Json            @default("{}")
+  isDuplicateOf     String?
+  createdAt         DateTime        @default(now())
+  updatedAt         DateTime        @updatedAt
+  deletedAt         DateTime?
+  deletedById       String?
+
+  statusHistory  LeadStatusHistory[]
+  pipelineStages LeadPipelineStage[]
+  activities     Activity[]
+  notes          Note[]
+  followups      Followup[]
+  conversations  Conversation[]
+  tags           LeadTag[]
+  customer       Customer?
+  files          Attachment[]
+
+  @@unique([tenantId, leadNumber])
+  @@index([tenantId, status])
+  @@index([tenantId, priority])
+  @@index([tenantId, assignedToId])
+  @@index([tenantId, source])
+  @@index([tenantId, mobile])
+  @@index([tenantId, email])
+  @@index([tenantId, createdAt])
+  @@index([tenantId, nextFollowupAt])
+  @@index([tenantId, campaignId])
+}
+
+// Per-tenant sequence generator for human-readable lead numbers (LEAD-000123)
+model LeadCounter {
+  tenantId String @id
+  value    Int    @default(0)
+}
+
+model LeadStatusHistory {
+  id          String           @id @default(uuid())
+  tenantId    String
+  leadId      String
+  lead        Lead             @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  oldStatus   LeadStatusValue?
+  newStatus   LeadStatusValue
+  changedById String?
+  reason      String?
+  changedAt   DateTime         @default(now())
+
+  @@index([tenantId, leadId])
+}
+
+// Simple "contacts" register (distinct people who may relate to multiple leads/customers)
+model Contact {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  mobile    String?
+  email     String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId, mobile])
+  @@index([tenantId, email])
+}
+
+model Tag {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  color     String   @default("#6366f1")
+  createdAt DateTime @default(now())
+
+  leadTags LeadTag[]
+
+  @@unique([tenantId, name])
+}
+
+model LeadTag {
+  leadId String
+  lead   Lead   @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  tagId  String
+  tag    Tag    @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([leadId, tagId])
+}
+
+enum CustomFieldEntity {
+  LEAD
+  CUSTOMER
+  DEAL
+}
+
+enum CustomFieldType {
+  TEXT
+  NUMBER
+  DATE
+  DROPDOWN
+  MULTI_SELECT
+  BOOLEAN
+  EMAIL
+  PHONE
+  URL
+}
+
+// EAV-style definitions; values are stored as JSON on the owning record
+// (Lead.customFieldValues / Customer.customFieldValues) so new fields never
+// require a schema migration.
+model CustomFieldDefinition {
+  id        String            @id @default(uuid())
+  tenantId  String
+  tenant    Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  entity    CustomFieldEntity
+  key       String
+  label     String
+  type      CustomFieldType
+  options   Json? // for DROPDOWN / MULTI_SELECT
+  required  Boolean           @default(false)
+  sortOrder Int               @default(0)
+  createdAt DateTime          @default(now())
+
+  @@unique([tenantId, entity, key])
+}
+
+enum ActivityType {
+  CALL
+  WHATSAPP
+  EMAIL
+  SMS
+  NOTE
+  MEETING
+  DEMO
+  FOLLOW_UP
+  STATUS_CHANGE
+  ASSIGNMENT
+  PAYMENT
+  ORDER
+  LEAD_CREATED
+  CONVERSION
+  OTHER
+}
+
+enum ActivityChannel {
+  WHATSAPP
+  FACEBOOK
+  INSTAGRAM
+  GMAIL
+  SMS
+  CALL
+  SYSTEM
+  MANUAL
+}
+
+// Append-only activity timeline. Rows should never be deleted or mutated by
+// normal application flows.
+model Activity {
+  id          String          @id @default(uuid())
+  tenantId    String
+  tenant      Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadId      String?
+  lead        Lead?           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  customerId  String?
+  customer    Customer?       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  userId      String?
+  user        User?           @relation("ActivityUser", fields: [userId], references: [id])
+  type        ActivityType
+  channel     ActivityChannel @default(MANUAL)
+  subject     String?
+  description String?
+  metadata    Json?
+  createdAt   DateTime        @default(now())
+
+  @@index([tenantId, leadId, createdAt])
+  @@index([tenantId, customerId, createdAt])
+}
+
+model Note {
+  id         String   @id @default(uuid())
+  tenantId   String
+  tenant     Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadId     String?
+  lead       Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  userId     String
+  user       User     @relation("NoteUser", fields: [userId], references: [id])
+  content    String
+  isInternal Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@index([tenantId, leadId])
+}
+
+enum FollowupStatus {
+  PENDING
+  COMPLETED
+  CANCELLED
+  OVERDUE
+}
+
+model Followup {
+  id           String         @id @default(uuid())
+  tenantId     String
+  tenant       Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadId       String
+  lead         Lead           @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  assignedToId String
+  assignedTo   User           @relation("FollowupAssignee", fields: [assignedToId], references: [id])
+  title        String
+  description  String?
+  dueDate      DateTime
+  priority     LeadPriority   @default(MEDIUM)
+  status       FollowupStatus @default(PENDING)
+  completedAt  DateTime?
+  createdById  String
+  createdBy    User           @relation("FollowupCreator", fields: [createdById], references: [id])
+  createdAt    DateTime       @default(now())
+  updatedAt    DateTime       @updatedAt
+
+  @@index([tenantId, status, dueDate])
+  @@index([tenantId, assignedToId, status])
+  @@index([tenantId, leadId])
+}
+
+// ---------------------------------------------------------------------------
+// Pipelines
+// ---------------------------------------------------------------------------
+
+model Pipeline {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name      String
+  type      String   @default("SALES") // SALES | SUPPORT | RENEWAL | CUSTOM
+  isDefault Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  stages     PipelineStage[]
+  leadStages LeadPipelineStage[]
+
+  @@index([tenantId])
+}
+
+model PipelineStage {
+  id         String           @id @default(uuid())
+  tenantId   String
+  pipelineId String
+  pipeline   Pipeline         @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  name       String
+  status     LeadStatusValue?
+  sortOrder  Int              @default(0)
+  color      String           @default("#6366f1")
+  createdAt  DateTime         @default(now())
+
+  leadStages LeadPipelineStage[]
+
+  @@index([pipelineId])
+}
+
+// Current + historical placement of a lead within a pipeline's stages.
+model LeadPipelineStage {
+  id         String        @id @default(uuid())
+  tenantId   String
+  leadId     String
+  lead       Lead          @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  pipelineId String
+  pipeline   Pipeline      @relation(fields: [pipelineId], references: [id], onDelete: Cascade)
+  stageId    String
+  stage      PipelineStage @relation(fields: [stageId], references: [id], onDelete: Cascade)
+  dealValue  Decimal?      @db.Decimal(12, 2)
+  enteredAt  DateTime      @default(now())
+  exitedAt   DateTime?
+  movedById  String?
+
+  @@index([tenantId, pipelineId, stageId])
+  @@index([tenantId, leadId])
+}
+
+// ---------------------------------------------------------------------------
+// Customers
+// ---------------------------------------------------------------------------
+
+enum CustomerStatus {
+  ACTIVE
+  INACTIVE
+}
+
+model Customer {
+  id                String         @id @default(uuid())
+  tenantId          String
+  tenant            Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadId            String?        @unique
+  lead              Lead?          @relation(fields: [leadId], references: [id])
+  name              String
+  mobile            String?
+  email             String?
+  company           String?
+  address           String?
+  ownerId           String?
+  owner             User?          @relation("CustomerOwner", fields: [ownerId], references: [id])
+  status            CustomerStatus @default(ACTIVE)
+  customerSince     DateTime       @default(now())
+  customFieldValues Json           @default("{}")
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+  deletedAt         DateTime?
+
+  activities    Activity[]
+  conversations Conversation[]
+  deals         Deal[]
+
+  @@index([tenantId, mobile])
+  @@index([tenantId, email])
+  @@index([tenantId, status])
+}
+
+model Deal {
+  id         String   @id @default(uuid())
+  tenantId   String
+  customerId String
+  customer   Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  title      String
+  value      Decimal  @db.Decimal(12, 2)
+  currency   String   @default("INR")
+  status     String   @default("OPEN")
+  createdAt  DateTime @default(now())
+
+  @@index([tenantId, customerId])
+}
+
+// ---------------------------------------------------------------------------
+// Campaigns
+// ---------------------------------------------------------------------------
+
+model Campaign {
+  id                 String     @id @default(uuid())
+  tenantId           String
+  tenant             Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name               String
+  platform           LeadSource @default(OTHER)
+  campaignIdExternal String?
+  adSet              String?
+  ad                 String?
+  startDate          DateTime?
+  endDate            DateTime?
+  budget             Decimal?   @db.Decimal(12, 2)
+  createdAt          DateTime   @default(now())
+
+  leads   Lead[]
+  sources CampaignSource[]
+
+  @@index([tenantId])
+}
+
+model CampaignSource {
+  id         String     @id @default(uuid())
+  tenantId   String
+  campaignId String
+  campaign   Campaign   @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  source     LeadSource
+  externalId String?
+  createdAt  DateTime   @default(now())
+
+  @@index([campaignId])
+}
+
+// ---------------------------------------------------------------------------
+// Omnichannel conversations
+// ---------------------------------------------------------------------------
+
+enum ConversationChannel {
+  WHATSAPP
+  FACEBOOK
+  INSTAGRAM
+  GMAIL
+  SMS
+  OTHER
+}
+
+enum ConversationStatus {
+  OPEN
+  CLOSED
+}
+
+model Conversation {
+  id                     String              @id @default(uuid())
+  tenantId               String
+  tenant                 Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  leadId                 String?
+  lead                   Lead?               @relation(fields: [leadId], references: [id])
+  customerId             String?
+  customer               Customer?           @relation(fields: [customerId], references: [id])
+  channel                ConversationChannel
+  externalConversationId String?
+  status                 ConversationStatus  @default(OPEN)
+  startedAt              DateTime            @default(now())
+  lastMessageAt          DateTime?
+
+  messages Message[]
+
+  @@unique([tenantId, channel, externalConversationId])
+  @@index([tenantId, leadId])
+  @@index([tenantId, customerId])
+}
+
+enum MessageDirection {
+  INBOUND
+  OUTBOUND
+}
+
+enum MessageType {
+  TEXT
+  IMAGE
+  VIDEO
+  DOCUMENT
+  AUDIO
+  TEMPLATE
+  OTHER
+}
+
+enum MessageProviderStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  READ
+  FAILED
+}
+
+model Message {
+  id                String                @id @default(uuid())
+  tenantId          String
+  conversationId    String
+  conversation      Conversation          @relation(fields: [conversationId], references: [id], onDelete: Cascade)
+  externalMessageId String?
+  direction         MessageDirection
+  sender            String?
+  recipient         String?
+  messageType       MessageType           @default(TEXT)
+  content           String?
+  attachmentUrl     String?
+  providerStatus    MessageProviderStatus @default(QUEUED)
+  providerMetadata  Json?
+  sentAt            DateTime?
+  receivedAt        DateTime?
+  createdAt         DateTime              @default(now())
+
+  @@unique([tenantId, externalMessageId])
+  @@index([tenantId, conversationId, createdAt])
+}
+
+model Attachment {
+  id            String   @id @default(uuid())
+  tenantId      String
+  leadId        String?
+  lead          Lead?    @relation(fields: [leadId], references: [id], onDelete: Cascade)
+  fileName      String
+  fileType      String
+  fileSizeBytes Int
+  storageKey    String // object storage key; never a publicly-guessable URL
+  uploadedById  String?
+  createdAt     DateTime @default(now())
+
+  @@index([tenantId, leadId])
+}
+
+// ---------------------------------------------------------------------------
+// Integrations
+// ---------------------------------------------------------------------------
+
+enum IntegrationProvider {
+  WHATSAPP
+  FACEBOOK
+  INSTAGRAM
+  GMAIL
+}
+
+enum IntegrationMode {
+  MOCK
+  LIVE
+}
+
+model IntegrationConnection {
+  id                   String              @id @default(uuid())
+  tenantId             String
+  tenant               Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  provider             IntegrationProvider
+  mode                 IntegrationMode     @default(MOCK)
+  status               String              @default("DISCONNECTED") // DISCONNECTED | CONNECTED | ERROR
+  externalAccountId    String?
+  // Secrets are stored encrypted at rest via the storage layer (see
+  // src/lib/secrets.ts) and are never sent to the browser.
+  encryptedCredentials String?
+  config               Json?
+  connectedById        String?
+  connectedAt          DateTime?
+  lastSyncedAt         DateTime?
+  createdAt            DateTime            @default(now())
+  updatedAt            DateTime            @updatedAt
+
+  @@unique([tenantId, provider])
+}
+
+// Raw inbound provider events, used for idempotency + audit/debug replay.
+model WebhookEvent {
+  id              String              @id @default(uuid())
+  tenantId        String? // resolved after payload is parsed; nullable until matched
+  provider        IntegrationProvider
+  providerEventId String
+  signatureValid  Boolean
+  payload         Json
+  processedAt     DateTime?
+  processingError String?
+  createdAt       DateTime            @default(now())
+
+  @@unique([provider, providerEventId])
+  @@index([tenantId, provider])
+}
+
+model OutboundWebhook {
+  id        String   @id @default(uuid())
+  tenantId  String
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  url       String
+  secret    String
+  events    String[] // e.g. ["lead.created", "lead.converted"]
+  isActive  Boolean  @default(true)
+  createdAt DateTime @default(now())
+
+  deliveries OutboundWebhookDelivery[]
+
+  @@index([tenantId])
+}
+
+model OutboundWebhookDelivery {
+  id         String          @id @default(uuid())
+  webhookId  String
+  webhook    OutboundWebhook @relation(fields: [webhookId], references: [id], onDelete: Cascade)
+  event      String
+  payload    Json
+  statusCode Int?
+  success    Boolean         @default(false)
+  attempt    Int             @default(1)
+  createdAt  DateTime        @default(now())
+}
+
+// ---------------------------------------------------------------------------
+// Notifications
+// ---------------------------------------------------------------------------
+
+enum NotificationType {
+  NEW_LEAD
+  LEAD_ASSIGNED
+  FOLLOWUP_DUE
+  FOLLOWUP_OVERDUE
+  MENTION
+  MESSAGE_RECEIVED
+  SYSTEM
+  BILLING
+}
+
+model Notification {
+  id                String           @id @default(uuid())
+  tenantId          String
+  tenant            Tenant           @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId            String
+  user              User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type              NotificationType
+  title             String
+  body              String?
+  relatedEntityType String?
+  relatedEntityId   String?
+  readAt            DateTime?
+  createdAt         DateTime         @default(now())
+
+  @@index([tenantId, userId, readAt])
+}
+
+model NotificationPreference {
+  id     String           @id @default(uuid())
+  userId String
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   NotificationType
+  inApp  Boolean          @default(true)
+  email  Boolean          @default(false)
+
+  @@unique([userId, type])
+}
+
+// ---------------------------------------------------------------------------
+// Audit log
+// ---------------------------------------------------------------------------
+
+model AuditLog {
+  id          String   @id @default(uuid())
+  tenantId    String?
+  tenant      Tenant?  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  actorUserId String?
+  actor       User?    @relation(fields: [actorUserId], references: [id])
+  action      String // e.g. "lead.created", "user.role_changed"
+  entityType  String
+  entityId    String?
+  oldValues   Json?
+  newValues   Json?
+  ipAddress   String?
+  userAgent   String?
+  createdAt   DateTime @default(now())
+
+  @@index([tenantId, createdAt])
+  @@index([tenantId, entityType, entityId])
+}
+
+// ---------------------------------------------------------------------------
+// Support access (platform admin impersonation)
+// ---------------------------------------------------------------------------
+
+model SupportAccessSession {
+  id          String    @id @default(uuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  adminUserId String
+  admin       User      @relation(fields: [adminUserId], references: [id])
+  reason      String
+  startedAt   DateTime  @default(now())
+  endedAt     DateTime?
+
+  @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------
+// API keys
+// ---------------------------------------------------------------------------
+
+model ApiKey {
+  id          String    @id @default(uuid())
+  tenantId    String
+  tenant      Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name        String
+  keyPrefix   String // first chars shown in UI for identification, e.g. "mcrm_live_ab12"
+  keyHash     String    @unique // sha-256 of full key; full key is only ever shown once at creation
+  createdById String?
+  createdBy   User?     @relation(fields: [createdById], references: [id])
+  lastUsedAt  DateTime?
+  revokedAt   DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------
+// Automation engine
+// ---------------------------------------------------------------------------
+
+enum AutomationEvent {
+  LEAD_CREATED
+  LEAD_UPDATED
+  LEAD_ASSIGNED
+  STATUS_CHANGED
+  FOLLOWUP_DUE
+  MESSAGE_RECEIVED
+  MESSAGE_SENT
+  CUSTOMER_CONVERTED
+  PAYMENT_RECEIVED
+}
+
+model AutomationRule {
+  id           String          @id @default(uuid())
+  tenantId     String
+  tenant       Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name         String
+  triggerEvent AutomationEvent
+  conditions   Json // e.g. [{ field: "priority", op: "eq", value: "URGENT" }]
+  actions      Json // e.g. [{ type: "assign_round_robin" }, { type: "create_followup", hoursFromNow: 2 }]
+  isActive     Boolean         @default(true)
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  runs AutomationRun[]
+
+  @@index([tenantId, triggerEvent])
+}
+
+model AutomationRun {
+  id         String         @id @default(uuid())
+  ruleId     String
+  rule       AutomationRule @relation(fields: [ruleId], references: [id], onDelete: Cascade)
+  tenantId   String
+  entityType String
+  entityId   String
+  status     String         @default("SUCCESS") // SUCCESS | FAILED | SKIPPED
+  detail     Json?
+  createdAt  DateTime       @default(now())
+
+  @@index([tenantId, ruleId])
+}
+
+// ---------------------------------------------------------------------------
+// AI usage tracking
+// ---------------------------------------------------------------------------
+
+model AiRequestLog {
+  id               String    @id @default(uuid())
+  tenantId         String
+  userId           String?
+  provider         String // pluggable: "mock" | "anthropic" | ...
+  feature          String // "lead_summary" | "suggested_reply" | ...
+  entityType       String?
+  entityId         String?
+  promptTokens     Int?
+  completionTokens Int?
+  approvedAt       DateTime? // for customer-facing content requiring human approval
+  createdAt        DateTime  @default(now())
+
+  @@index([tenantId, feature])
+}
