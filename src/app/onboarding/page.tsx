@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { requireTenantContext } from "@/server/tenant";
 import { prisma } from "@/server/db/client";
+import { withTenantContext } from "@/server/db/tenant-context";
 import { OnboardingWizard } from "./onboarding-wizard";
 
 export default async function OnboardingPage() {
@@ -9,10 +10,12 @@ export default async function OnboardingPage() {
   const tenant = await prisma.tenant.findUnique({ where: { id: ctx.tenant.id } });
   if (tenant?.onboardingCompletedAt) redirect("/dashboard");
 
-  const pipeline = await prisma.pipeline.findFirst({
-    where: { tenantId: ctx.tenant.id, isDefault: true },
-    include: { stages: { orderBy: { sortOrder: "asc" } } },
-  });
+  const pipeline = await withTenantContext(ctx.tenant.id, (tx) =>
+    tx.pipeline.findFirst({
+      where: { tenantId: ctx.tenant.id, isDefault: true },
+      include: { stages: { orderBy: { sortOrder: "asc" } } },
+    }),
+  );
 
   return (
     <div className="mx-auto max-w-2xl px-6 py-16">

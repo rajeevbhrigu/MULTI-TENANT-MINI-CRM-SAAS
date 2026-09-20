@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { requireTenantContext } from "@/server/tenant";
 import { prisma } from "@/server/db/client";
+import { withTenantContext } from "@/server/db/tenant-context";
 import { Sidebar } from "@/components/app/sidebar";
 import { MobileNav } from "@/components/app/mobile-nav";
 import { GlobalSearch } from "@/components/app/global-search";
@@ -29,11 +30,13 @@ export default async function AppLayout({ children }: { children: React.ReactNod
     prisma.notification.count({
       where: { tenantId: ctx.tenant.id, userId: ctx.session.user.id, readAt: null },
     }),
-    prisma.supportAccessSession.findFirst({
-      where: { tenantId: ctx.tenant.id, endedAt: null },
-      include: { admin: true },
-      orderBy: { startedAt: "desc" },
-    }),
+    withTenantContext(ctx.tenant.id, (tx) =>
+      tx.supportAccessSession.findFirst({
+        where: { tenantId: ctx.tenant.id, endedAt: null },
+        include: { admin: true },
+        orderBy: { startedAt: "desc" },
+      }),
+    ),
   ]);
 
   const workspaceOptions = memberships.map((m) => ({

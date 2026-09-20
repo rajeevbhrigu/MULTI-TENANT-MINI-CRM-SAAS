@@ -1,5 +1,6 @@
 import "server-only";
 import { prisma } from "@/server/db/client";
+import { withPlatformAdminContext } from "@/server/db/tenant-context";
 
 /**
  * Background job: scans pending follow-ups and notifies the assignee when
@@ -13,10 +14,14 @@ import { prisma } from "@/server/db/client";
  */
 export async function runFollowupReminders(): Promise<{ notified: number; overdue: number }> {
   const now = new Date();
-  const dueOrOverdue = await prisma.followup.findMany({
-    where: { status: "PENDING", dueDate: { lte: now } },
-    include: { lead: true },
-  });
+  // Deliberately cross-tenant: this trusted internal job (see the
+  // INTERNAL_JOB_TOKEN-gated route) scans every tenant's due follow-ups.
+  const dueOrOverdue = await withPlatformAdminContext((tx) =>
+    tx.followup.findMany({
+      where: { status: "PENDING", dueDate: { lte: now } },
+      include: { lead: true },
+    }),
+  );
 
   let notified = 0;
   let markedOverdue = 0;

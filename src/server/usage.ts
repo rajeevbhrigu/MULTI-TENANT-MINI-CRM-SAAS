@@ -1,5 +1,6 @@
 import "server-only";
 import { prisma } from "@/server/db/client";
+import { withTenantContext } from "@/server/db/tenant-context";
 
 export class UsageLimitError extends Error {
   constructor(message: string) {
@@ -21,7 +22,7 @@ export async function assertWithinLeadLimit(tenantId: string): Promise<void> {
   });
   if (!subscription) return; // no subscription record yet (shouldn't happen post-signup)
 
-  const count = await prisma.lead.count({ where: { tenantId, deletedAt: null } });
+  const count = await withTenantContext(tenantId, (tx) => tx.lead.count({ where: { tenantId, deletedAt: null } }));
   if (count >= subscription.plan.maxLeads) {
     throw new UsageLimitError(
       `Your ${subscription.plan.name} plan allows up to ${subscription.plan.maxLeads} leads. Upgrade your plan to add more.`,
@@ -49,9 +50,9 @@ export async function getUsageSummary(tenantId: string) {
   if (!subscription) return null;
 
   const [leads, users, messages] = await Promise.all([
-    prisma.lead.count({ where: { tenantId, deletedAt: null } }),
+    withTenantContext(tenantId, (tx) => tx.lead.count({ where: { tenantId, deletedAt: null } })),
     prisma.tenantUser.count({ where: { tenantId, status: "ACTIVE" } }),
-    prisma.message.count({ where: { tenantId } }),
+    withTenantContext(tenantId, (tx) => tx.message.count({ where: { tenantId } })),
   ]);
 
   return {
